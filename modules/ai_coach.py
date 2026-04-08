@@ -12,8 +12,14 @@ import requests
 
 OLLAMA_URL = "http://localhost:11434"
 DEFAULT_MODEL = "llama3"
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama3-8b-8192"   # Free tier, same Llama 3
+GROQ_API_URL  = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL    = "llama-3.1-8b-instant"   # Current free Groq model (fast)
+GROQ_MODELS   = [                         # All available Groq free models
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+    "gemma2-9b-it",
+    "mixtral-8x7b-32768",
+]
 
 
 def _get_groq_key() -> str:
@@ -29,7 +35,8 @@ def _get_groq_key() -> str:
 
 
 def _llm_generate(prompt: str, temperature: float = 0.7,
-                  max_tokens: int = 1200) -> str:
+                  max_tokens: int = 1200,
+                  model: str = None) -> str:
     """
     Route LLM request to Groq (cloud) or Ollama (local) automatically.
     Raises Exception on failure.
@@ -38,6 +45,7 @@ def _llm_generate(prompt: str, temperature: float = 0.7,
 
     if groq_key:
         # ── Groq API (cloud) ──────────────────────────────────────
+        groq_model = model if model in GROQ_MODELS else GROQ_MODEL
         resp = requests.post(
             GROQ_API_URL,
             headers={
@@ -45,10 +53,10 @@ def _llm_generate(prompt: str, temperature: float = 0.7,
                 "Content-Type": "application/json",
             },
             json={
-                "model": GROQ_MODEL,
+                "model": groq_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": temperature,
-                "max_tokens": max_tokens,
+                "max_completion_tokens": max_tokens,
             },
             timeout=30
         )
@@ -80,8 +88,8 @@ def check_ollama_status() -> dict:
     if groq_key:
         return {
             'running': True,
-            'models': [GROQ_MODEL],
-            'message': f'Groq API active (Llama 3 — cloud mode)',
+            'models': GROQ_MODELS,
+            'message': f'Groq API active ({GROQ_MODEL} — cloud mode)',
             'backend': 'groq'
         }
 
