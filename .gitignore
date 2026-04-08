@@ -1,0 +1,26 @@
+# Large model files — too big for GitHub
+models/
+
+# Database and session data — user-specific
+data/neuronudge.db
+data/sessions/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Secrets — NEVER push API keys
+.streamlit/secrets.toml
+.env
+
+# Audio test files
+*.wav
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temp files
+tmp_*.txt
