@@ -26,8 +26,15 @@ def show_browser_live_session(bpm: int = 72,
     st.audio_input records simultaneously for auto-analysis.
     Returns audio bytes when recording stops, else None.
     """
-    sens = {"Low": (0.30, 600), "Medium": (0.42, 380), "High": (0.55, 250)}
-    stutter_ratio, debounce_ms = sens.get(sensitivity, sens["Medium"])
+    sens = {
+        "Low":    {"ratio": 0.28, "debounce": 800},
+        "Medium": {"ratio": 0.40, "debounce": 600},
+        "High":   {"ratio": 0.52, "debounce": 350},
+    }
+    cfg = sens.get(sensitivity, sens["Medium"])
+    stutter_ratio       = cfg["ratio"]
+    debounce_ms         = cfg["debounce"]
+    max_pre_silence_ms  = 500   # ms since last speech → block won't fire (natural pause)
 
     html = f"""
 <!DOCTYPE html><html><head><meta charset="utf-8">
@@ -101,8 +108,8 @@ button{{
 </div>
 
 <script>
-const BPM={bpm}, SR={stutter_ratio}, DBNC={debounce_ms};
-const CALIB_SEC=5, SMOOTH=0.90, MIN_ON_MS=2000, MIN_OFF_MS=1200;
+const BPM={bpm}, SR={stutter_ratio}, DBNC={debounce_ms}, MAX_PRE={max_pre_silence_ms};
+const CALIB_SEC=5, SMOOTH=0.93, MIN_ON_MS=2200, MIN_OFF_MS=1500;
 
 let actx=null,ana=null,stream=null,running=false;
 let calib=true,calibSamples=[],spoke=false;
@@ -110,6 +117,7 @@ let eThr=0,rThr=0,peak=0,ambient=0,speakMid=0;
 let metOn=false,cnt=0,t0=null,smooth=0;
 let metroTimer=null,nextBeat=0,beatIdx=0;
 let metroOnTime=0,metroOffTime=0;
+let lastSpeechTime=0;  // tracks last time user was actively speaking
 
 // Debounce timestamps
 let blockDbnc=null,recovDbnc=null;
@@ -134,7 +142,7 @@ async function startSess() {{
     cnt=0;metOn=false;smooth=0;
     blockDbnc=null;recovDbnc=null;
     prolongStart=null;prolongHist=[];crossings=[];lastCross=null;
-    t0=Date.now();metroOffTime=Date.now();
+    t0=Date.now();metroOffTime=Date.now();lastSpeechTime=0;
     document.getElementById('bs').style.display='none';
     document.getElementById('be').style.display='block';
     document.getElementById('mc').classList.remove('on');
@@ -180,6 +188,9 @@ function loop() {{
 
   const now=Date.now();
 
+  // Track last active speech time (used to exclude natural pauses from block detection)
+  if(smooth>rThr*0.7) lastSpeechTime=now;
+
   // ── Recovery: stop metronome ─────────────────────────────
   if(metOn && smooth>rThr) {{
     if(!recovDbnc) recovDbnc=now;
@@ -194,8 +205,11 @@ function loop() {{
 
   if(metOn) return; // already correcting — skip detection
 
-  // ── 1. Block: energy drop ────────────────────────────────
-  if(smooth<eThr) {{
+  // ── 1. Block: energy drop DURING active speech only ────
+  // Only fires if user was speaking within MAX_PRE ms — excludes
+  // natural pauses, full stops, and end-of-sentence silence.
+  const speechWasRecent = lastSpeechTime>0 && (now-lastSpeechTime)<MAX_PRE;
+  if(smooth<eThr && speechWasRecent) {{
     if(!blockDbnc) blockDbnc=now;
     else if(now-blockDbnc>=DBNC && now-metroOffTime>=MIN_OFF_MS) {{
       trigger('block'); return;
