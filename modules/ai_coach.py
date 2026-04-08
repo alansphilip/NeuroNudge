@@ -265,7 +265,7 @@ Generate a **professional speech therapy coaching report** in EXACTLY this forma
 Use clinical but accessible language. Be specific to THEIR numbers. Under 350 words."""
 
     try:
-        text = _llm_generate(prompt, temperature=0.7, max_tokens=1200)
+        text = _llm_generate(prompt, temperature=0.7, max_tokens=1200, model=model)
         return {
             'coaching': text,
             'success': True,
@@ -379,7 +379,7 @@ Format exactly:
 Be specific and practical. 3-4 sentences per day."""
 
     try:
-        text = _llm_generate(prompt, temperature=0.85, max_tokens=900)
+        text = _llm_generate(prompt, temperature=0.85, max_tokens=900, model=model)
         return {
             'plan': text, 'success': True, 'error': None,
             'weakness': primary_weakness, 'session_num': session_num,
