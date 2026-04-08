@@ -24,7 +24,6 @@ def is_native_audio_available() -> bool:
     try:
         import sounddevice as sd
         devices = sd.query_devices()
-        # Check there's at least one input device
         input_devs = [d for d in devices if d.get('max_input_channels', 0) > 0]
         return len(input_devs) > 0
     except Exception:
@@ -174,8 +173,8 @@ def render_metronome_widget(bpm: int = 72, auto_start: bool = False) -> None:
   let playing = false;
   const BPM = {bpm};
   const beatSec = 60.0 / BPM;
-  const LOOK_AHEAD = 0.1;  // seconds
-  const SCHEDULE_INTERVAL = 50;  // ms
+  const LOOK_AHEAD = 0.1;
+  const SCHEDULE_INTERVAL = 50;
 
   function getCtx() {{
     if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -201,7 +200,6 @@ def render_metronome_widget(bpm: int = 72, auto_start: bool = False) -> None:
     while (nextBeat < ctx.currentTime + LOOK_AHEAD) {{
       const accent = (beatCount % 4 === 0);
       scheduleClick(nextBeat, accent);
-      // visual flash
       const idx = beatCount % 4;
       const delay = (nextBeat - ctx.currentTime) * 1000;
       setTimeout(() => flashBeat(idx), Math.max(0, delay));
@@ -233,7 +231,7 @@ def render_metronome_widget(bpm: int = 72, auto_start: bool = False) -> None:
     beatCount = 0;
     scheduler();
     document.getElementById('statusLine').textContent =
-      '🟢 Metronome running at ' + BPM + ' BPM — speak now';
+      'Metronome running at ' + BPM + ' BPM — speak now';
   }}
 
   function stopMetronome() {{
@@ -270,27 +268,15 @@ def show_browser_live_session(bpm: int = 72,
 
     Returns: audio bytes if ready to analyse, else None
     """
-    st.info(
-        "☁️ **Cloud Mode** — Browser-based session. "
-        "Start the metronome, speak while it plays, then record and analyse.",
-        icon="🎙️"
-    )
-
-    # ── How it works ──────────────────────────────────────────
-    with st.expander("ℹ️ How Cloud Session Works", expanded=False):
-        st.markdown("""
-**Step 1:** Click **▶ Start** on the metronome below — it plays at your chosen BPM.
-
-**Step 2:** Click **🎙️ Start recording** in the recorder below while the metronome plays.
-
-**Step 3:** Speak naturally, keeping pace with the metronome beats.
-
-**Step 4:** Click **⏹ Stop** to end recording, then click **🔍 Analyse Recording**.
-
-> The metronome provides continuous rhythmic pacing — clinically proven to reduce
-> stuttering frequency. Your recording is then analysed for fluency, fillers,
-> repetitions, and WPM.
-        """)
+    # ── Simple step instructions ──────────────────────────────
+    st.markdown("""
+    **How to use:**
+    **1️⃣** Click **▶ Start** on the metronome &nbsp;→&nbsp;
+    **2️⃣** Tap the 🎙️ **mic button** below to start recording &nbsp;→&nbsp;
+    **3️⃣** Speak while the metronome plays &nbsp;→&nbsp;
+    **4️⃣** Tap mic again to stop &nbsp;→&nbsp;
+    **5️⃣** Click **Analyse Recording**
+    """)
 
     # ── Metronome widget ──────────────────────────────────────
     render_metronome_widget(bpm=bpm, auto_start=False)
@@ -299,15 +285,20 @@ def show_browser_live_session(bpm: int = 72,
 
     # ── Browser mic recording ─────────────────────────────────
     st.markdown("**🎙️ Record Your Speech**")
+    st.caption(
+        "👆 Tap the microphone button to start recording. "
+        "Tap again to stop. If the browser asks for mic permission, click **Allow**."
+    )
     audio_bytes = st.audio_input(
         "Record your voice",
         key="browser_live_input",
-        help="Click the microphone to start recording, click again to stop."
+        help="Tap the microphone icon to start. Tap again to stop recording."
     )
 
     if audio_bytes is not None:
         st.audio(audio_bytes, format="audio/wav")
         st.session_state['browser_audio_ready'] = audio_bytes
+        st.success("✅ Recording captured! Click **Analyse Recording** below.")
 
     # ── Analyse button ────────────────────────────────────────
     audio_ready = st.session_state.get('browser_audio_ready')
