@@ -514,6 +514,19 @@ def page_practice():
                                     "Upload WAV File"])
 
     with tab_live:
+        st.markdown("""
+        <div class="card" style="border-left: 4px solid #0F5132;">
+            <div class="card-header">How Smart Pacing Works</div>
+            <p style="color:#6B7B8D; line-height:1.7; font-size:13px; margin-top:8px;">
+                <b>Step 1:</b> Press Start and begin speaking naturally.<br>
+                <b>Step 2:</b> The system listens for ~5 seconds to learn your voice level.<br>
+                <b>Step 3:</b> Once calibrated, it monitors your speech energy in real-time.<br>
+                <b>Step 4:</b> When energy drops (stutter/block), the metronome auto-starts.<br>
+                <b>Step 5:</b> When your speech recovers, the metronome auto-stops.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
         st.markdown("### Session Settings")
         col_s1, col_s2, col_s3 = st.columns(3)
 
