@@ -1,7 +1,16 @@
 """
 Browser-based live session for NeuroNudge cloud deployment.
-Detects all three stutter types: block (energy drop), prolongation (sustained),
-repetition (rapid oscillations). Auto-metronome on any stutter.
+Faithfully mirrors modules/live_session.py (LivePacingSession) in JS:
+
+ Phase 0 – Learn ambient noise (~1 s, AMBIENT_FRAMES frames)
+ Phase 1 – Wait for user to start speaking (SNR > 2×)
+ Phase 2 – Calibrate on real speech (CALIB_FRAMES frames)
+ Phase 3 – Stutter detection with three independent modes:
+    1. Energy-drop    : sustained low energy after speech
+    2. Oscillation    : 4+ threshold crossings in 1.5 s (syllable stutter)
+    3. Word-repetition: Web Speech API partial text → 3+ same word in a row
+
+Recovery uses a grace-period (GRACE_SEC) just like the Python version.
 """
 
 import streamlit as st
@@ -11,7 +20,6 @@ import streamlit.components.v1 as components
 def is_native_audio_available() -> bool:
     try:
         import sounddevice as sd
-        devices = sd.query_devices()
         return any(d.get('max_input_channels', 0) > 0 for d in sd.query_devices())
     except Exception:
         return False
@@ -21,23 +29,23 @@ def show_browser_live_session(bpm: int = 72,
                               sensitivity: str = "Medium",
                               auto_metronome: bool = True):
     """
-    Cloud live session — mirrors local LivePacingSession.
-    All three stutter types detected in real time via Web Audio API.
-    st.audio_input records simultaneously for auto-analysis.
+    Cloud live session — faithfully mirrors local LivePacingSession.
+    Uses Web Audio API + Web Speech API for real-time detection.
     Returns audio bytes when recording stops, else None.
     """
+
+    # Match live_session.py sensitivity config exactly
     sens = {
-        "Low":    {"ratio": 0.28, "debounce": 800},
-        "Medium": {"ratio": 0.40, "debounce": 600},
-        "High":   {"ratio": 0.52, "debounce": 350},
+        "Low":    {"drop_ratio": 0.35, "pause_ignore_ms": 2000},
+        "Medium": {"drop_ratio": 0.30, "pause_ignore_ms": 1500},
+        "High":   {"drop_ratio": 0.25, "pause_ignore_ms": 1000},
     }
     cfg = sens.get(sensitivity, sens["Medium"])
-    stutter_ratio       = cfg["ratio"]
-    debounce_ms         = cfg["debounce"]
-    max_pre_silence_ms  = 500   # ms since last speech → block won't fire (natural pause)
+    drop_ratio      = cfg["drop_ratio"]
+    pause_ignore_ms = cfg["pause_ignore_ms"]
+    auto_met_js     = "true" if auto_metronome else "false"
 
-    html = f"""
-<!DOCTYPE html><html><head><meta charset="utf-8">
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
 *{{margin:0;padding:0;box-sizing:border-box;}}
 body{{font-family:'Segoe UI',sans-serif;background:#f8faf9;padding:10px;}}
@@ -46,9 +54,12 @@ body{{font-family:'Segoe UI',sans-serif;background:#f8faf9;padding:10px;}}
   color:white;border-radius:10px;padding:9px 14px;
   font-size:13px;font-weight:600;text-align:center;margin-bottom:8px;
 }}
-.metrics{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:8px;}}
+.phase{{
+  font-size:11px;opacity:.75;margin-top:3px;text-align:center;
+}}
+.metrics{{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:8px;}}
 .m{{background:#f0f7f3;border-radius:8px;padding:8px;text-align:center;}}
-.mv{{font-size:22px;font-weight:800;color:#0f5132;}}
+.mv{{font-size:20px;font-weight:800;color:#0f5132;}}
 .ml{{font-size:10px;color:#6b7b8d;margin-top:2px;}}
 .metro{{
   background:linear-gradient(135deg,#0f5132,#1a7a4a);border-radius:10px;
@@ -83,11 +94,13 @@ button{{
 </style></head><body>
 
 <div class="status" id="st">Click Start Session to begin</div>
+<div class="phase" id="ph"></div>
 
 <div class="metrics">
   <div class="m"><div class="mv" id="mt">0s</div><div class="ml">Time</div></div>
   <div class="m"><div class="mv" id="ms">0</div><div class="ml">Stutters</div></div>
   <div class="m"><div class="mv" id="mm">Idle</div><div class="ml">Metronome</div></div>
+  <div class="m"><div class="mv" id="msnr">—</div><div class="ml">SNR</div></div>
 </div>
 
 <div class="metro" id="mc">
@@ -108,212 +121,429 @@ button{{
 </div>
 
 <script>
-const BPM={bpm}, SR={stutter_ratio}, DBNC={debounce_ms}, MAX_PRE={max_pre_silence_ms};
-const CALIB_SEC=5, SMOOTH=0.93, MIN_ON_MS=2200, MIN_OFF_MS=1500;
+// ── Config (mirrors live_session.py) ────────────────────────────────────────
+const BPM            = {bpm};
+const DROP_RATIO     = {drop_ratio};       // fraction of dynamic range → stutter threshold
+const PAUSE_IGNORE   = {pause_ignore_ms}; // ms of sustained low energy before triggering
+const AUTO_MET       = {auto_met_js};
 
-let actx=null,ana=null,stream=null,running=false;
-let calib=true,calibSamples=[],spoke=false;
-let eThr=0,rThr=0,peak=0,ambient=0,speakMid=0;
-let metOn=false,cnt=0,t0=null,smooth=0;
-let metroTimer=null,nextBeat=0,beatIdx=0;
-let metroOnTime=0,metroOffTime=0;
-let lastSpeechTime=0;  // tracks last time user was actively speaking
+// Audio processing
+const SMOOTH_K       = 0.92;  // EMA coefficient (mirrors _SMOOTH_WINDOW≈4 → α≈1-1/4)
+const AMBIENT_FRAMES = 10;    // ~1 s of 100ms frames  (mirrors _AMBIENT_FRAMES)
+const CALIB_FRAMES   = 12;    // speech frames needed   (mirrors _CALIBRATION_FRAMES)
+const NOISE_WIN      = 50;    // rolling noise window   (mirrors _NOISE_WINDOW)
+const SPEECH_WIN     = 30;    // rolling speech window  (mirrors _SPEECH_WINDOW)
+const RECAL_EVERY    = 20;    // frames between recalibrations
+const SNR_SPEECH     = 2.0;   // SNR threshold to detect speech onset
 
-// Debounce timestamps
-let blockDbnc=null,recovDbnc=null;
+// Oscillation detection (mirrors _check_energy_oscillation)
+const OSC_WIN_MS     = 1500;  // 1.5 s window
+const OSC_MIN        = 4;     // 4+ crossings → syllable stutter
 
-// Prolongation state
-let prolongStart=null,prolongHist=[];
-const PROLONG_MS=700, PROLONG_VAR=0.00015;
+// Word repetition (Web Speech API, mirrors _scan_for_repetitions)
+const REP_MIN        = 3;     // 3+ consecutive same word
 
-// Repetition state
-let crossings=[],lastCross=null;
-const REP_WIN_MS=2500,REP_MIN=3,REP_MAX_GAP=600,REP_MIN_GAP=120;
+// Recovery grace (mirrors _RECOVERY_GRACE_SEC)
+const GRACE_MS       = 500;
 
+// Metronome min-on / min-off guards (prevents rapid flipping)
+const MIN_ON_MS      = 2000;
+const MIN_OFF_MS     = 1000;
+
+// ── State ────────────────────────────────────────────────────────────────────
+let actx=null, ana=null, stream=null, running=false;
+
+// Phase tracking
+const PHASE = {{IDLE:0, AMBIENT:1, WAIT_SPEECH:2, CALIBRATING:3, MONITORING:4}};
+let phase=PHASE.IDLE;
+
+// Smoothed RMS
+let smooth=0;
+
+// Ambient / noise floor
+let ambBuf=[], noiseTracker=[], noiseFloor=0;
+
+// Speech calibration
+let calibBuf=[], speechRecent=[];
+let eThr=0, rThr=0, midpoint=0;
+
+// Adaptive recalibration
+let recalCounter=0;
+
+// Metronome
+let metOn=false, cnt=0, t0=null;
+let metroTimer=null, nextBeat=0, beatIdx=0;
+let metroOnTime=0, metroOffTime=-MIN_OFF_MS;
+
+// Recovery grace
+let recovStart=null;
+
+// Phase 3 state
+let frameIdx=0;
+let lowEnergyStart=null;
+
+// Oscillation detection
+let energyCrossings=[], wasAbove=false;
+let oscActive=false;
+
+// Word-repetition (Web Speech API)
+let recognition=null, repActive=false;
+let lastPartialWords=[];
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function pct(arr, p) {{
+  const s=[...arr].sort((a,b)=>a-b);
+  return s[Math.floor(s.length*p)]||0;
+}}
+function mean(arr) {{ return arr.length ? arr.reduce((a,b)=>a+b)/arr.length : 0; }}
+function maxOf(arr) {{ return arr.reduce((a,b)=>b>a?b:a, -Infinity); }}
+
+function getNoise() {{
+  return Math.max(noiseFloor, 0.0001);
+}}
+
+function recalcThresholds() {{
+  if(!speechRecent.length) return;
+  const recentAvg = mean(speechRecent);
+  const noise = getNoise();
+  const dynRange = recentAvg - noise;
+  if(dynRange <= 0) {{
+    eThr = noise * 1.2;
+    rThr = noise * 1.5;
+  }} else {{
+    eThr = noise + dynRange * DROP_RATIO;
+    rThr = noise + dynRange * 0.45;
+  }}
+  midpoint = (eThr + rThr) / 2;
+}}
+
+function updateNoise(rms) {{
+  noiseTracker.push(rms);
+  if(noiseTracker.length > NOISE_WIN) noiseTracker.shift();
+  noiseFloor = pct(noiseTracker, 0.30);
+}}
+
+function updateSpeech(rms) {{
+  speechRecent.push(rms);
+  if(speechRecent.length > SPEECH_WIN) speechRecent.shift();
+}}
+
+function getSNR(rms) {{
+  return noiseFloor > 0 ? rms / noiseFloor : 100;
+}}
+
+// ── Start session ────────────────────────────────────────────────────────────
 async function startSess() {{
   try {{
-    document.getElementById('st').textContent='Requesting microphone...';
+    setStatus('Requesting microphone...');
     stream=await navigator.mediaDevices.getUserMedia({{audio:true,video:false}});
     actx=new (window.AudioContext||window.webkitAudioContext)();
     const src=actx.createMediaStreamSource(stream);
-    ana=actx.createAnalyser(); ana.fftSize=2048; ana.smoothingTimeConstant=0.1;
+    ana=actx.createAnalyser(); ana.fftSize=2048; ana.smoothingTimeConstant=0.0;
     src.connect(ana);
-    running=true;calib=true;calibSamples=[];spoke=false;
-    cnt=0;metOn=false;smooth=0;
-    blockDbnc=null;recovDbnc=null;
-    prolongStart=null;prolongHist=[];crossings=[];lastCross=null;
-    t0=Date.now();metroOffTime=Date.now();lastSpeechTime=0;
+
+    running=true; smooth=0; t0=Date.now();
+    ambBuf=[]; noiseTracker=[]; noiseFloor=0;
+    calibBuf=[]; speechRecent=[];
+    eThr=0; rThr=0; midpoint=0;
+    recalCounter=0; frameIdx=0;
+    metOn=false; cnt=0;
+    metroOnTime=0; metroOffTime=Date.now()-MIN_OFF_MS;
+    recovStart=null;
+    lowEnergyStart=null;
+    energyCrossings=[]; wasAbove=false; oscActive=false;
+    repActive=false; lastPartialWords=[];
+
+    phase=PHASE.AMBIENT;
+
     document.getElementById('bs').style.display='none';
     document.getElementById('be').style.display='block';
     document.getElementById('mc').classList.remove('on');
     document.getElementById('done').classList.remove('show');
     document.getElementById('ms').textContent='0';
     document.getElementById('mm').textContent='Idle';
+    document.getElementById('msnr').textContent='—';
+
+    startSpeechRec();
     loop();
   }} catch(e) {{
-    document.getElementById('st').textContent='Mic error: '+e.message+' — allow mic and retry';
+    setStatus('Mic error: '+e.message+' — allow mic and retry');
   }}
 }}
 
+// ── Main audio loop (100ms per frame via requestAnimationFrame) ───────────────
+let lastFrameMs=0;
 function loop() {{
   if(!running) return;
   requestAnimationFrame(loop);
+
+  const now=Date.now();
+  if(now - lastFrameMs < 80) return; // ~10 fps processing, avoid flooding
+  lastFrameMs=now;
+
   const buf=new Float32Array(ana.frequencyBinCount);
   ana.getFloatTimeDomainData(buf);
   let s=0; for(let i=0;i<buf.length;i++) s+=buf[i]*buf[i];
   const rms=Math.sqrt(s/buf.length);
-  smooth=SMOOTH*smooth+(1-SMOOTH)*rms;
-  const el=(Date.now()-t0)/1000;
+  smooth = SMOOTH_K*smooth + (1-SMOOTH_K)*rms;
+
+  const el=(now-t0)/1000;
   document.getElementById('mt').textContent=Math.floor(el)+'s';
 
-  if(calib) {{
-    calibSamples.push(smooth);
-    if(smooth>0.01) spoke=true;
-    document.getElementById('st').textContent=spoke
-      ?'Calibrating… speak naturally ('+(Math.max(1,Math.ceil(CALIB_SEC-el)))+'s left)'
-      :'Listening… start speaking now';
-    if(el>=CALIB_SEC && spoke) {{
-      const sorted=[...calibSamples].sort((a,b)=>a-b);
-      ambient=sorted[Math.floor(sorted.length*0.1)]||0.001;
-      const spSam=calibSamples.filter(v=>v>ambient*2);
-      peak=spSam.length>5 ? spSam.reduce((a,b)=>a+b)/spSam.length
-                          : sorted[Math.floor(sorted.length*0.85)];
-      eThr=peak*SR; rThr=peak*(SR+0.18); speakMid=peak*0.55;
-      calib=false;
-      document.getElementById('st').textContent=
-        'Monitoring — metronome auto-starts on stutter (block / prolongation / repetition)';
+  frameIdx++;
+
+  // ── PHASE 0: Ambient noise learning (~1 s) ───────────────────────────────
+  if(phase === PHASE.AMBIENT) {{
+    ambBuf.push(rms);
+    noiseTracker.push(rms);
+    setStatus('Learning ambient noise… please stay silent ('+(Math.max(1,Math.ceil(1-el)))+'s)');
+    setPh('Phase 1/4 — Ambient noise calibration');
+    if(ambBuf.length >= AMBIENT_FRAMES) {{
+      noiseFloor = pct(noiseTracker, 0.30);
+      phase = PHASE.WAIT_SPEECH;
     }}
     return;
   }}
 
-  const now=Date.now();
-
-  // Track last active speech time (used to exclude natural pauses from block detection)
-  if(smooth>rThr*0.7) lastSpeechTime=now;
-
-  // ── Recovery: stop metronome ─────────────────────────────
-  if(metOn && smooth>rThr) {{
-    if(!recovDbnc) recovDbnc=now;
-    else if(now-recovDbnc>=DBNC && now-metroOnTime>=MIN_ON_MS) {{
-      metOn=false; metroOffTime=now; recovDbnc=null; blockDbnc=null;
-      stopMetro();
-      document.getElementById('mm').textContent='Idle';
-      document.getElementById('st').textContent=
-        'Monitoring — metronome auto-starts on stutter';
+  // ── PHASE 1: Wait for user to start speaking ─────────────────────────────
+  if(phase === PHASE.WAIT_SPEECH) {{
+    const snr = getSNR(rms);
+    document.getElementById('msnr').textContent = snr.toFixed(1)+'×';
+    if(snr > SNR_SPEECH && rms > 0.002) {{
+      phase = PHASE.CALIBRATING;
+      setStatus('Calibrating… keep speaking naturally');
+      setPh('Phase 2/4 — Calibrating on your voice');
+    }} else {{
+      updateNoise(rms);
+      setStatus('Listening… start speaking now');
+      setPh('Phase 2/4 — Waiting for speech (SNR: '+snr.toFixed(1)+'×)');
     }}
-  }} else if(metOn) {{ recovDbnc=null; }}
+    return;
+  }}
 
-  if(metOn) return; // already correcting — skip detection
+  // ── PHASE 2: Calibrate from actual speech ───────────────────────────────
+  if(phase === PHASE.CALIBRATING) {{
+    const snr = getSNR(rms);
+    document.getElementById('msnr').textContent = snr.toFixed(1)+'×';
+    if(snr > SNR_SPEECH) calibBuf.push(rms);
 
-  // ── 1. Block: energy drop DURING active speech only ────
-  // Only fires if user was speaking within MAX_PRE ms — excludes
-  // natural pauses, full stops, and end-of-sentence silence.
-  const speechWasRecent = lastSpeechTime>0 && (now-lastSpeechTime)<MAX_PRE;
-  if(smooth<eThr && speechWasRecent) {{
-    if(!blockDbnc) blockDbnc=now;
-    else if(now-blockDbnc>=DBNC && now-metroOffTime>=MIN_OFF_MS) {{
-      trigger('block'); return;
+    const remain = Math.max(0, CALIB_FRAMES - calibBuf.length);
+    setStatus('Calibrating… keep speaking ('+remain+' frames left)');
+    setPh('Phase 3/4 — Measuring your speech level');
+
+    if(calibBuf.length >= CALIB_FRAMES) {{
+      // Seed recent speech tracker
+      speechRecent = [...calibBuf];
+      noiseTracker = [...ambBuf, ...noiseTracker.slice(-20)];
+      noiseFloor   = pct(noiseTracker, 0.30);
+      recalcThresholds();
+      phase = PHASE.MONITORING;
+      setStatus('Monitoring — metronome auto-starts on stutter');
+      setPh('Phase 4/4 — Live monitoring active');
     }}
-  }} else {{ blockDbnc=null; }}
+    return;
+  }}
 
-  // ── 2. Prolongation: stable moderate energy ──────────────
-  if(smooth>ambient*2.5 && smooth<peak*0.8) {{
-    if(!prolongStart) {{ prolongStart=now; prolongHist=[smooth]; }}
-    else {{
-      prolongHist.push(smooth);
-      if(now-prolongStart>PROLONG_MS && prolongHist.length>12) {{
-        const mean=prolongHist.reduce((a,b)=>a+b)/prolongHist.length;
-        const vari=prolongHist.reduce((s,v)=>s+(v-mean)**2,0)/prolongHist.length;
-        if(vari<PROLONG_VAR && now-metroOffTime>=MIN_OFF_MS) {{
-          trigger('prolongation'); return;
-        }}
-      }}
+  // ── PHASE 3: Stutter detection ───────────────────────────────────────────
+  const snr = getSNR(smooth);
+  document.getElementById('msnr').textContent = snr.toFixed(1)+'×';
+
+  // Update noise floor from low-energy frames
+  if(smooth < eThr) updateNoise(rms);
+  // Update speech level from high-energy frames
+  if(smooth > rThr) updateSpeech(rms);
+
+  // Periodic recalibration
+  recalCounter++;
+  if(recalCounter >= RECAL_EVERY) {{
+    recalCounter=0;
+    recalcThresholds();
+  }}
+
+  // ── Recovery check (runs before detection; mirrors _stop_metronome) ──────
+  if(metOn && smooth > rThr) {{
+    if(!recovStart) {{
+      recovStart = now;  // start grace timer
+    }} else if(now - recovStart >= GRACE_MS && now - metroOnTime >= MIN_ON_MS) {{
+      stopMetronome('energy_recovery');
     }}
-  }} else {{ prolongStart=null; prolongHist=[]; }}
+  }} else if(metOn && smooth <= rThr) {{
+    recovStart = null;  // reset grace if energy drops again
+  }}
 
-  // ── 3. Repetition: rapid energy crossings ────────────────
-  const crossState=smooth>speakMid;
-  if(lastCross!==null && crossState!==lastCross && crossState) {{
-    crossings.push(now);
-    crossings=crossings.filter(t=>now-t<REP_WIN_MS);
-    if(crossings.length>=REP_MIN) {{
-      const gaps=[];
-      for(let i=1;i<crossings.length;i++) gaps.push(crossings[i]-crossings[i-1]);
-      const avg=gaps.reduce((a,b)=>a+b)/gaps.length;
-      const maxGap=Math.max(...gaps), minGap=Math.min(...gaps);
-      // Rhythmicity gate: gaps must be evenly spaced — hallmark of true word repetition
-      const rhythmic=(maxGap-minGap)<avg*0.7;
-      if(avg<REP_MAX_GAP && avg>REP_MIN_GAP && rhythmic && now-metroOffTime>=MIN_OFF_MS) {{
-        trigger('repetition'); crossings=[]; return;
-      }}
+  if(metOn) return; // already correcting, skip new triggers
+
+  // ── Mode 1: Energy drop (sustained low energy after speech) ─────────────
+  if(smooth < eThr) {{
+    if(lowEnergyStart === null) lowEnergyStart = now;
+    const lowDur = now - lowEnergyStart;
+    if(lowDur >= PAUSE_IGNORE && now - metroOffTime >= MIN_OFF_MS) {{
+      triggerMetronome('block');
+      return;
+    }}
+    setStatus('Low energy… ('+Math.floor(lowDur/100)/10+'s / '+PAUSE_IGNORE/1000+'s)');
+  }} else {{
+    lowEnergyStart = null;
+  }}
+
+  // ── Mode 2: Energy oscillation — syllable stuttering (b-b-b-ball) ────────
+  const isAbove = smooth > midpoint;
+  if(isAbove !== wasAbove) {{
+    energyCrossings.push(now);
+    wasAbove = isAbove;
+  }}
+  energyCrossings = energyCrossings.filter(t => now - t < OSC_WIN_MS);
+
+  if(energyCrossings.length >= OSC_MIN) {{
+    if(!oscActive && now - metroOffTime >= MIN_OFF_MS) {{
+      oscActive = true;
+      triggerMetronome('syllable_stutter');
+      return;
+    }}
+  }} else {{
+    if(oscActive && energyCrossings.length <= 1) oscActive = false;
+  }}
+}}
+
+// ── Mode 3: Word repetition via Web Speech API ────────────────────────────
+function startSpeechRec() {{
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if(!SR) return;
+  recognition = new SR();
+  recognition.lang = 'en-US';
+  recognition.continuous = true;
+  recognition.interimResults = true;
+
+  recognition.onresult = (e) => {{
+    if(!running || phase !== PHASE.MONITORING) return;
+    let partial = '';
+    for(let i=e.resultIndex; i<e.results.length; i++) {{
+      if(!e.results[i].isFinal) partial += e.results[i][0].transcript;
+    }}
+    const words = partial.trim().toLowerCase().split(/\\s+/).filter(w=>w);
+    if(words.length < REP_MIN) return;
+    if(words.length === lastPartialWords.length) return;
+    lastPartialWords = words;
+    scanRepetitions(words);
+  }};
+
+  recognition.onend = () => {{ if(running) recognition.start(); }};
+  recognition.onerror = () => {{ if(running) setTimeout(()=>recognition.start(), 500); }};
+  try {{ recognition.start(); }} catch(e) {{}}
+}}
+
+function scanRepetitions(words) {{
+  // Count consecutive same word at end of partial (mirrors _scan_for_repetitions)
+  let consec = 1;
+  for(let i=words.length-1; i>0; i--) {{
+    if(words[i]===words[i-1]) consec++;
+    else break;
+  }}
+  const now = Date.now();
+  if(consec >= REP_MIN && !repActive && !metOn && now - metroOffTime >= MIN_OFF_MS) {{
+    repActive = true;
+    triggerMetronome('repetition', words[words.length-1], consec);
+    return;
+  }}
+  // Recovery: 3+ unique words
+  if(repActive) {{
+    let unique=1;
+    for(let i=words.length-1;i>0;i--) {{
+      if(words[i]!==words[i-1]) {{ unique++; if(unique>=3) break; }}
+      else break;
+    }}
+    if(unique >= 3) {{
+      repActive=false;
+      if(metOn) stopMetronome('fluent_recovery');
     }}
   }}
-  lastCross=crossState;
 }}
 
-function trigger(type) {{
+// ── Trigger / stop metronome ─────────────────────────────────────────────────
+function triggerMetronome(type, word, count) {{
+  if(!AUTO_MET || metOn) return;
   metOn=true; cnt++;
-  metroOnTime=Date.now(); blockDbnc=null; recovDbnc=null;
-  prolongStart=null; prolongHist=[]; crossings=[];
-  startMetro(type);
+  metroOnTime=Date.now();
+  recovStart=null; lowEnergyStart=null;
+  oscActive=true; energyCrossings=[];
+
+  startMetro();
   document.getElementById('ms').textContent=cnt;
   document.getElementById('mm').textContent='ACTIVE';
-  const labels={{block:'Block detected',prolongation:'Prolongation detected',repetition:'Repetition detected'}};
-  document.getElementById('st').textContent=(labels[type]||'Stutter')+' — follow the metronome!';
-  document.getElementById('metroType').textContent=
-    (labels[type]||'Stutter')+' — follow the rhythm';
+  const labels={{block:'Block detected',syllable_stutter:'Syllable stutter',repetition:'Repetition detected'}};
+  const winfo = word ? ` ("${{word}}" ×${{count}})` : '';
+  setStatus((labels[type]||'Stutter')+winfo+' — follow the metronome!');
+  document.getElementById('metroType').textContent=(labels[type]||'Stutter')+' — follow the rhythm';
+  document.getElementById('mc').classList.add('on');
+  setPh('🔴 Stutter event #'+cnt);
 }}
 
-function startMetro(type) {{
-  document.getElementById('mc').classList.add('on');
+function stopMetronome(reason) {{
+  if(!metOn) return;
+  metOn=false;
+  metroOffTime=Date.now();
+  recovStart=null; oscActive=false; repActive=false;
+  clearTimeout(metroTimer);
+  document.querySelectorAll('.dot').forEach(d=>d.classList.remove('on'));
+  document.getElementById('mc').classList.remove('on');
+  document.getElementById('mm').textContent='Idle';
+  setStatus('Monitoring — metronome auto-starts on stutter');
+  setPh('Phase 4/4 — Live monitoring active');
+}}
+
+// ── Metronome scheduler (Web Audio, mirrors _start_metronome) ────────────────
+function startMetro() {{
   beatIdx=0; nextBeat=actx.currentTime+0.05; sched();
 }}
 
 function sched() {{
   if(!metOn) return;
-  while(nextBeat<actx.currentTime+0.12) {{
-    click(nextBeat,beatIdx%4===0);
-    const i=beatIdx%4,d=(nextBeat-actx.currentTime)*1000;
-    setTimeout(()=>flash(i),Math.max(0,d));
-    nextBeat+=60/BPM; beatIdx++;
+  while(nextBeat < actx.currentTime+0.12) {{
+    click(nextBeat, beatIdx%4===0);
+    const d=(nextBeat-actx.currentTime)*1000;
+    const i=beatIdx%4;
+    setTimeout(()=>flash(i), Math.max(0,d));
+    nextBeat += 60/BPM; beatIdx++;
   }}
   metroTimer=setTimeout(sched,40);
 }}
 
 function click(t,acc) {{
-  const o=actx.createOscillator(),g=actx.createGain();
-  o.connect(g);g.connect(actx.destination);
-  o.frequency.value=acc?1000:880;
-  g.gain.setValueAtTime(acc?0.5:0.3,t);
-  g.gain.exponentialRampToValueAtTime(0.001,t+0.04);
-  o.start(t);o.stop(t+0.045);
+  const o=actx.createOscillator(), g=actx.createGain();
+  o.connect(g); g.connect(actx.destination);
+  o.frequency.value = acc?1000:880;
+  g.gain.setValueAtTime(acc?0.5:0.3, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t+0.04);
+  o.start(t); o.stop(t+0.045);
 }}
 
 function flash(i) {{
   document.querySelectorAll('.dot').forEach((d,j)=>d.classList.toggle('on',j===i));
 }}
 
-function stopMetro() {{
+// ── Stop session ─────────────────────────────────────────────────────────────
+function stopSess() {{
+  running=false; metOn=false;
   clearTimeout(metroTimer);
   document.querySelectorAll('.dot').forEach(d=>d.classList.remove('on'));
-  document.getElementById('mc').classList.remove('on');
-}}
-
-function stopSess() {{
-  running=false;metOn=false;stopMetro();
   if(stream) stream.getTracks().forEach(t=>t.stop());
+  try {{ if(recognition) recognition.stop(); }} catch(e) {{}}
   document.getElementById('be').style.display='none';
   document.getElementById('bs').style.display='block';
   document.getElementById('bs').textContent='🔄 New Session';
-  document.getElementById('st').textContent=
-    'Session complete — '+cnt+' stutter event(s) detected';
+  setStatus('Session complete — '+cnt+' stutter event(s) detected');
   document.getElementById('mm').textContent=cnt?cnt+' events':'None';
+  document.getElementById('mc').classList.remove('on');
   document.getElementById('done').classList.add('show');
+  setPh('');
 }}
+
+function setStatus(msg) {{ document.getElementById('st').textContent=msg; }}
+function setPh(msg)     {{ document.getElementById('ph').textContent=msg; }}
 </script></body></html>
 """
 
-    components.html(html, height=370, scrolling=False)
+    components.html(html, height=400, scrolling=False)
 
     st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
     st.markdown("**🎙️ Record Your Session**")
