@@ -109,9 +109,13 @@ const DROP_RATIO   = {drop_ratio};
 const PAUSE_IGNORE = {pause_ignore_ms};
 const AUTO_MET     = {auto_met_js};
 
-// Smoothing — only Mode 1 uses the heavy EMA
-const SLOW_K       = 0.92;  // τ ≈ 1.2 s  → catches sustained blocks
-// Modes 2 & 3 use raw RMS (instant response) → catches fast word humps
+// Three smoothing levels — mirrors live_session.py philosophy:
+//   SLOW_K (0.92, τ≈1.2 s) : Mode 1 — sustained energy-drop blocks
+//   MID_K  (0.60, τ≈140ms) : Mode 2 — syllable oscillations (mirrors Python 4-frame SMA)
+//   FAST_K (0.30, τ≈80ms)  : Mode 3 — word-level humps (fast but not raw noise)
+const SLOW_K = 0.92;
+const MID_K  = 0.60;
+const FAST_K = 0.30;
 
 // Calibration
 const AMBIENT_FRAMES = 10;
@@ -151,8 +155,11 @@ let actx=null, ana=null, stream=null, running=false;
 let phase=0; // 0=IDLE 1=AMBIENT 2=WAIT_SPEECH 3=CALIBRATING 4=MONITORING
 let t0=null, lastFrameMs=0, frameIdx=0;
 
-// Signal
-let smooth=0, rms=0;  // smooth = heavy EMA; rms = raw instantaneous
+// Signal — three smoothing levels
+let smooth=0;      // heavy EMA  (Mode 1)
+let smoothMid=0;   // medium EMA (Mode 2 syllable)
+let smoothFast=0;  // fast EMA   (Mode 3 word-rep)
+let rms=0;         // raw instantaneous (used only for noise floor updates)
 
 // Noise / calibration
 let ambBuf=[], noiseTracker=[], noiseFloor=0;
@@ -221,6 +228,7 @@ async function startSess(){{
     eThr=0; rThr=0; oscMid=0; wrepMid=0; recalCounter=0;
     metOn=false; cnt=0;
     metroOnTime=0; metroOffTime=Date.now()-MIN_OFF_MS; recovStart=null;
+    smooth=0; smoothMid=0; smoothFast=0; rms=0;
     lowEnergyStart=null; lastSpeechTime=0;
     oscCrossings=[]; lastOscAbove=null; oscActive=false;
     wrepCrossings=[]; lastWrepAbove=null; wrepActive=false; lastWrepCrossTime=0;
@@ -248,8 +256,10 @@ function loop(){{
   const buf=new Float32Array(ana.frequencyBinCount);
   ana.getFloatTimeDomainData(buf);
   let s=0; for(let i=0;i<buf.length;i++) s+=buf[i]*buf[i];
-  rms=Math.sqrt(s/buf.length);             // raw, instantaneous
-  smooth=SLOW_K*smooth+(1-SLOW_K)*rms;    // heavy EMA (Mode 1 only)
+  rms      = Math.sqrt(s/buf.length);
+  smooth    = SLOW_K*smooth    + (1-SLOW_K)*rms;   // Mode 1 — heavy
+  smoothMid = MID_K *smoothMid + (1-MID_K) *rms;   // Mode 2 — medium (mirrors Python 4-frame SMA)
+  smoothFast= FAST_K*smoothFast+ (1-FAST_K)*rms;   // Mode 3 — fast
 
   const el=(now-t0)/1000;
   document.getElementById('mt').textContent=Math.floor(el)+'s';
@@ -342,9 +352,11 @@ function loop(){{
     }}
   }}else lowEnergyStart=null;
 
-  // ── Mode 2: Syllable stutter — raw RMS crossings at oscMid ───────────────
-  // Only count crossings while speech is active (not during natural pauses).
-  const aboveOsc=(rms>oscMid);
+  // ── Mode 2: Syllable stutter — smoothMid crossings at oscMid ───────────────
+  // Uses medium EMA (K=0.6, τ≈140ms) — mirrors Python's 4-frame rolling average.
+  // Inter-word gaps in fluent speech (50-100ms) don't drop smoothMid below oscMid.
+  // Stutter gaps (200ms+) do → produces crossings only on real b-b-b stutters.
+  const aboveOsc=(smoothMid>oscMid);
   if(speechWasRecent && lastOscAbove!==null && aboveOsc!==lastOscAbove) oscCrossings.push(now);
   lastOscAbove=aboveOsc;
   oscCrossings=oscCrossings.filter(t=>now-t<OSC_WIN_MS);
@@ -353,10 +365,10 @@ function loop(){{
   }}
   if(oscActive && oscCrossings.length<=1) oscActive=false;
 
-  // ── Mode 3: Word repetition — raw RMS crossings at wrepMid ───────────────
-  // Only accumulate crossings while speech was recent (prevents silence noise
-  // from building up a fake repetition pattern during a natural pause).
-  const aboveWrep=(rms>wrepMid);
+  // ── Mode 3: Word repetition — smoothFast crossings at wrepMid ───────────────
+  // Uses fast EMA (K=0.3, τ≈80ms) — fast enough to track individual word humps
+  // (200-400ms each) but smoother than raw RMS so within-frame noise is filtered.
+  const aboveWrep=(smoothFast>wrepMid);
   if(speechWasRecentWrep && lastWrepAbove!==null && aboveWrep!==lastWrepAbove){{
     if(now-lastWrepCrossTime>WREP_MIN_GAP){{
       wrepCrossings.push(now);
