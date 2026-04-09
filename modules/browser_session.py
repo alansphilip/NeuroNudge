@@ -36,10 +36,13 @@ def show_browser_live_session(bpm: int = 72,
     """
     Cloud live session. Returns audio bytes when recording stops, else None.
     """
+    # PAUSE_IGNORE increased from Python defaults: browser has no audio
+    # separation between input/output streams, so normal sentence pauses
+    # (0.5-2 s) must not trip the block detector.
     sens = {
-        "Low":    {"drop_ratio": 0.35, "pause_ignore_ms": 2000},
-        "Medium": {"drop_ratio": 0.30, "pause_ignore_ms": 1500},
-        "High":   {"drop_ratio": 0.25, "pause_ignore_ms": 1000},
+        "Low":    {"drop_ratio": 0.35, "pause_ignore_ms": 3000},
+        "Medium": {"drop_ratio": 0.30, "pause_ignore_ms": 2500},
+        "High":   {"drop_ratio": 0.25, "pause_ignore_ms": 2000},
     }
     cfg             = sens.get(sensitivity, sens["Medium"])
     drop_ratio      = cfg["drop_ratio"]
@@ -122,8 +125,9 @@ const RECAL_EVERY    = 20;   // every 20 frames
 const SNR_THRESH     = 2.0;
 const GRACE_MS       = 500;  // _RECOVERY_GRACE_SEC = 0.5 s
 
-// Repetition (mirrors _REP_THRESHOLD=2, _FLUENT_RECOVERY=3)
-const REP_THRESH    = 2;     // 2+ same consecutive words = stutter
+// Repetition — REP_THRESH=3 (not 2 as in Python) because Web Speech API
+// interim results are noisier than Vosk and produce more false repeats.
+const REP_THRESH    = 3;     // 3+ same consecutive words = stutter
 const REP_RECOVERY  = 3;     // 3+ unique consecutive words = fluent
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -138,7 +142,7 @@ let ambBuf=[], calibBuf=[], recalCounter=0, calibrated=false;
 
 let metOn=false, cnt=0;
 let metroTimer=null, nextBeat=0, beatIdx=0;
-let lowEnergyStart=null, recovStart=null;
+let lowEnergyStart=null, recovStart=null, prevSmoothed=0;
 
 // Repetition (Web Speech API)
 let recognition=null, repActive=false, lastWords=[];
@@ -338,18 +342,27 @@ function loop(){{
   document.getElementById('msnr').textContent=getSNR(smoothed).toFixed(1)+'×';
 
   if(smoothed<eThr) updateNoise(rms);       // line 432
-  if(smoothed>rThr) updateSpeech(rms);      // line 436
+  // Update speech level at eThr*1.2 (not just rThr) so thresholds adapt
+  // when user speaks softer post-calibration — prevents eThr drifting high
+  // and turning normal moderate speech into perpetual "low energy".
+  if(smoothed>eThr*1.2) updateSpeech(rms);
   if(++recalCounter>=RECAL_EVERY){{recalCounter=0; recalc();}}  // line 441
 
   // Mode 1: Energy drop (lines 447-466)
+  // Only ARM the block timer if the previous frame was clearly above eThr
+  // (i.e. they were speaking and energy just dropped). If they were already
+  // quiet (prevSmoothed <= eThr), don't start the timer — this prevents
+  // false triggers when the user simply starts the session at low volume.
   if(smoothed<eThr){{
-    if(!lowEnergyStart) lowEnergyStart=now;
-    if(now-lowEnergyStart>=PAUSE_IGNORE)
+    if(!lowEnergyStart && prevSmoothed>eThr)
+      lowEnergyStart=now;   // ARM: came from above threshold → now dropped
+    if(lowEnergyStart && now-lowEnergyStart>=PAUSE_IGNORE)
       triggerMetronome('energy_drop','Block — follow the metronome!');
   }}else{{
     if(smoothed>rThr) tryStop();   // energy recovery attempt
     lowEnergyStart=null;
   }}
+  prevSmoothed=smoothed;
 }}
 
 // ── Trigger — mirrors _trigger_metronome() ────────────────────────────────────
