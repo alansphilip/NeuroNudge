@@ -140,6 +140,12 @@ const GRACE_MS     = 500;
 const MIN_ON_MS    = 2000;
 const MIN_OFF_MS   = 1000;
 
+// Speech-context guard — prevents natural pauses triggering the metronome.
+// Modes 1/2 only fire if speech was active within MAX_SPEECH_GAP ms.
+// Mode 3 allows a slightly longer look-back (repetitions can have brief gaps).
+const MAX_SPEECH_GAP      = 600;   // ms — block/syllable
+const MAX_SPEECH_GAP_WREP = 1200;  // ms — word-repetition (words may be slow)
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let actx=null, ana=null, stream=null, running=false;
 let phase=0; // 0=IDLE 1=AMBIENT 2=WAIT_SPEECH 3=CALIBRATING 4=MONITORING
@@ -161,6 +167,9 @@ let metroOnTime=0, metroOffTime=0, recovStart=null;
 
 // Mode 1
 let lowEnergyStart=null;
+
+// Speech-context tracking (mirrors lastSpeechTime in live_session.py)
+let lastSpeechTime=0;
 
 // Mode 2 — syllable oscillation (raw RMS)
 let oscCrossings=[], lastOscAbove=null, oscActive=false;
@@ -212,7 +221,7 @@ async function startSess(){{
     eThr=0; rThr=0; oscMid=0; wrepMid=0; recalCounter=0;
     metOn=false; cnt=0;
     metroOnTime=0; metroOffTime=Date.now()-MIN_OFF_MS; recovStart=null;
-    lowEnergyStart=null;
+    lowEnergyStart=null; lastSpeechTime=0;
     oscCrossings=[]; lastOscAbove=null; oscActive=false;
     wrepCrossings=[]; lastWrepAbove=null; wrepActive=false; lastWrepCrossTime=0;
     phase=1;
@@ -296,6 +305,23 @@ function loop(){{
   if(smooth>rThr) updateSpeech(rms);
   if(++recalCounter>=RECAL_EVERY){{recalCounter=0; recalc();}}
 
+  // Track last active speech moment (energy clearly above noise)
+  // This is the key guard against natural pauses triggering the metronome.
+  if(smooth > rThr*0.7) lastSpeechTime=now;
+
+  const speechWasRecent     = lastSpeechTime>0 && (now-lastSpeechTime)<MAX_SPEECH_GAP;
+  const speechWasRecentWrep = lastSpeechTime>0 && (now-lastSpeechTime)<MAX_SPEECH_GAP_WREP;
+
+  // If not speaking recently, clear accumulated crossing data so stale
+  // crossings from before the pause don't combine with post-pause crossings.
+  if(!speechWasRecent) {{
+    lowEnergyStart=null;
+    oscCrossings=[]; oscActive=false;
+  }}
+  if(!speechWasRecentWrep) {{
+    wrepCrossings=[]; wrepActive=false;
+  }}
+
   // ── Recovery (before new triggers) ───────────────────────────────────────
   if(metOn){{
     if(smooth>rThr){{
@@ -307,7 +333,9 @@ function loop(){{
   }}
 
   // ── Mode 1: Energy-drop block ─────────────────────────────────────────────
-  if(smooth<eThr){{
+  // ONLY fires when speech was active within MAX_SPEECH_GAP ms.
+  // Natural pauses, full stops, and end-of-sentence silence are excluded.
+  if(smooth<eThr && speechWasRecent){{
     if(!lowEnergyStart) lowEnergyStart=now;
     if(now-lowEnergyStart>=PAUSE_IGNORE && now-metroOffTime>=MIN_OFF_MS){{
       trigger('block'); return;
@@ -315,9 +343,9 @@ function loop(){{
   }}else lowEnergyStart=null;
 
   // ── Mode 2: Syllable stutter — raw RMS crossings at oscMid ───────────────
-  // (b-b-b-ball: fast oscillations, 4+ in 1.5 s)
+  // Only count crossings while speech is active (not during natural pauses).
   const aboveOsc=(rms>oscMid);
-  if(lastOscAbove!==null && aboveOsc!==lastOscAbove) oscCrossings.push(now);
+  if(speechWasRecent && lastOscAbove!==null && aboveOsc!==lastOscAbove) oscCrossings.push(now);
   lastOscAbove=aboveOsc;
   oscCrossings=oscCrossings.filter(t=>now-t<OSC_WIN_MS);
   if(oscCrossings.length>=OSC_MIN && !oscActive && now-metroOffTime>=MIN_OFF_MS){{
@@ -326,12 +354,10 @@ function loop(){{
   if(oscActive && oscCrossings.length<=1) oscActive=false;
 
   // ── Mode 3: Word repetition — raw RMS crossings at wrepMid ───────────────
-  // "the-the-the": each word = UP crossing + DOWN crossing = 2 crossings
-  // 3 repetitions → min 5 crossings, evenly spaced (rhythmicity gate)
-  // Using raw RMS means the signal swings immediately with each word hump.
+  // Only accumulate crossings while speech was recent (prevents silence noise
+  // from building up a fake repetition pattern during a natural pause).
   const aboveWrep=(rms>wrepMid);
-  if(lastWrepAbove!==null && aboveWrep!==lastWrepAbove){{
-    // Debounce: ignore crossings within 80 ms of the previous one
+  if(speechWasRecentWrep && lastWrepAbove!==null && aboveWrep!==lastWrepAbove){{
     if(now-lastWrepCrossTime>WREP_MIN_GAP){{
       wrepCrossings.push(now);
       lastWrepCrossTime=now;
