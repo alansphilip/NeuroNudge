@@ -1,19 +1,27 @@
 """
 Browser-based live session for NeuroNudge cloud deployment.
 
-FINAL STABLE VERSION — two detection modes only:
+Direct JavaScript port of modules/live_session.py LivePacingSession.
+Every constant and algorithm mirrors the Python source exactly.
 
-  Mode 1 — BLOCK      : energy drops below noise×SNR_THRESH for PAUSE_IGNORE ms
-                         AND SNR is near ambient (not just soft speech).
-  Mode 3 — REPETITION : smoothFast crosses wrepMid ≥ 6 times in 1.5 s
-                         with each gap 80–300 ms and rhythmicity < 0.5.
-                         Gap cap of 300 ms ensures only FAST repetitions
-                         (stuttered words) trigger — not normal speech transitions
-                         (which have 300–600 ms word gaps).
-
-Mode 2 (syllable oscillation) has been REMOVED because normal speech at
-2–3 words/sec creates 4+ smoothMid crossings per 1.5 s window, causing the
-metronome to cycle continuously.
+Python → JS mapping:
+  _energy_buffer (SMA-4)     → smaBuffer[4]          getSMA(rms)
+  _noise_tracker (50 frames) → noiseTracker[50]       updateNoise()
+  _recent_speech (30 frames) → speechBuf[30]          updateSpeech()
+  _noise_floor               → noiseFloor             pct(30th %)
+  energy_threshold           → eThr
+  recovery_threshold         → rThr
+  _low_energy_start          → lowEnergyStart
+  _energy_crossings          → energyCrossings
+  _was_above_threshold       → wasAbove
+  _oscillation_active        → oscActive
+  _recovery_start            → recovStart
+  _OSCILLATION_WINDOW=1.5s   → OSC_WIN_MS=1500
+  _OSCILLATION_MIN=4         → OSC_MIN=4
+  _RECOVERY_GRACE_SEC=0.5    → GRACE_MS=500
+  _CALIBRATION_FRAMES=12     → CALIB_FRAMES=12
+  _AMBIENT_FRAMES=10         → AMBIENT_FRAMES=10
+  recal_counter (every 20)   → recalCounter (every 20)
 """
 
 import streamlit as st
@@ -32,13 +40,14 @@ def show_browser_live_session(bpm: int = 72,
                               sensitivity: str = "Medium",
                               auto_metronome: bool = True):
     """
-    Cloud live session using Web Audio API.
-    Returns audio bytes (st.audio_input) when recording stops, else None.
+    Cloud live session — direct JS port of LivePacingSession.
+    Returns audio bytes when recording stops, else None.
     """
+    # Exact values from live_session.py _sens_config
     sens = {
-        "Low":    {"drop_ratio": 0.35, "pause_ignore_ms": 3000},
-        "Medium": {"drop_ratio": 0.30, "pause_ignore_ms": 2500},
-        "High":   {"drop_ratio": 0.25, "pause_ignore_ms": 2000},
+        "Low":    {"drop_ratio": 0.35, "pause_ignore_ms": 2000},
+        "Medium": {"drop_ratio": 0.30, "pause_ignore_ms": 1500},
+        "High":   {"drop_ratio": 0.25, "pause_ignore_ms": 1000},
     }
     cfg             = sens.get(sensitivity, sens["Medium"])
     drop_ratio      = cfg["drop_ratio"]
@@ -80,14 +89,12 @@ button{{border:none;border-radius:8px;padding:10px;font-size:13px;
 
 <div class="status" id="st">Click Start Session to begin</div>
 <div class="phase"  id="ph"></div>
-
 <div class="metrics">
   <div class="m"><div class="mv" id="mt">0s</div><div class="ml">Time</div></div>
   <div class="m"><div class="mv" id="ms">0</div><div class="ml">Stutters</div></div>
   <div class="m"><div class="mv" id="mm">Idle</div><div class="ml">Metronome</div></div>
   <div class="m"><div class="mv" id="msnr">—</div><div class="ml">SNR</div></div>
 </div>
-
 <div class="metro" id="mc">
   <div class="mbpm">{bpm} BPM</div>
   <div class="msub" id="metroType">Metronome — Active</div>
@@ -96,102 +103,99 @@ button{{border:none;border-radius:8px;padding:10px;font-size:13px;
     <span class="dot" id="d2"></span><span class="dot" id="d3"></span>
   </div>
 </div>
-
 <div class="btns">
   <button class="bstart" id="bs" onclick="startSess()">🎙 Start Session</button>
   <button class="bstop"  id="be" onclick="stopSess()">⏹ Stop Session</button>
 </div>
 <div class="done" id="done">
-  ✅ Session done — stop the mic recorder below to run analysis automatically.
+  ✅ Session done — stop the mic recorder below to run analysis.
 </div>
 
 <script>
-// ── Config ────────────────────────────────────────────────────────────────────
+// ── Constants (mirrors live_session.py exactly) ───────────────────────────────
 const BPM          = {bpm};
-const DROP_RATIO   = {drop_ratio};
-const PAUSE_IGNORE = {pause_ignore_ms};
+const DROP_RATIO   = {drop_ratio};         // _drop_ratio
+const PAUSE_IGNORE = {pause_ignore_ms};    // _pause_ignore_sec (ms)
 const AUTO_MET     = {auto_met_js};
 
-// Smoothing
-const SLOW_K  = 0.92;  // Mode 1 block — heavy EMA (τ≈1.2 s)
-const FAST_K  = 0.30;  // Mode 3 word-rep — fast EMA (τ≈80 ms)
+const SMA_WIN        = 4;    // _SMOOTH_WINDOW = 4
+const AMBIENT_FRAMES = 10;   // _AMBIENT_FRAMES = 10
+const CALIB_FRAMES   = 12;   // _CALIBRATION_FRAMES = 12
+const NOISE_WIN      = 50;   // _NOISE_WINDOW = 50
+const SPEECH_WIN     = 30;   // _SPEECH_WINDOW = 30
+const RECAL_EVERY    = 20;   // recal_counter threshold
+const SNR_THRESH     = 2.0;  // speech_snr_thresh = 2.0
 
-// Calibration
-const AMBIENT_FRAMES = 10;
-const CALIB_FRAMES   = 10;
-const NOISE_WIN      = 50;
-const SPEECH_WIN     = 30;
-const RECAL_EVERY    = 20;
-const SNR_THRESH     = 2.0;
-
-// ── Mode 3: Word-repetition ──────────────────────────────────────────────────
-// "the-the-the" → smoothFast crosses wrepMid 6+ times in 1.5 s
-// Gap constraint 80–300 ms is the KEY discriminator:
-//   Stuttered words repeat at 3–10 Hz → gap 100–330 ms ✓
-//   Normal speech word transitions are 300–600 ms apart → rejected ✓
-const WREP_WIN_MS  = 1500;  // 1.5 s window
-const WREP_MIN     = 6;     // 6 crossings ≈ 3 word repetitions
-const WREP_DBN_MS  = 60;    // crossing debounce (ignore < 60 ms apart)
-const WREP_AVG_MIN = 80;    // ms — avg gap lower bound
-const WREP_AVG_MAX = 300;   // ms — avg gap upper bound (KEY: rejects slow speech)
-const WREP_RHYTHM  = 0.50;  // (gMax-gMin)/gAvg < 0.5 — tight rhythmicity
-
-// ── Recovery & guards ────────────────────────────────────────────────────────
-const GRACE_MS        = 800;   // fluent speech must persist this long before stopping
-const MIN_ON_MS       = 2500;  // metronome stays on at least 2.5 s
-const MIN_OFF_MS      = 2500;  // metronome stays off at least 2.5 s before re-trigger
-const MAX_SPEECH_GAP  = 700;   // ms — Mode 1: must have spoken within this window
-const MAX_SPEECH_WREP = 1200;  // ms — Mode 3: speech look-back window
+const OSC_WIN_MS  = 1500;    // _OSCILLATION_WINDOW = 1.5 s
+const OSC_MIN     = 4;       // _OSCILLATION_MIN = 4
+const GRACE_MS    = 500;     // _RECOVERY_GRACE_SEC = 0.5 s
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let actx=null, ana=null, stream=null, running=false;
-let phase=0;  // 0=IDLE 1=AMBIENT 2=WAIT_SPEECH 3=CALIBRATING 4=MONITORING
+let phase=0;   // 0=IDLE 1=AMBIENT 2=WAIT_SPEECH 3=CALIBRATING 4=MONITORING
 let t0=null, lastFrameMs=0;
 
-let smooth=0, smoothFast=0, rms=0;
+// Signal — getSMA() mirrors _smoothed_energy()
+let smaBuf=[];   // _energy_buffer
+let rms=0;
 
-let ambBuf=[], noiseTracker=[], noiseFloor=0;
-let calibBuf=[], speechBuf=[];
-let eThr=0, rThr=0, wrepMid=0;
-let recalCounter=0;
+// Noise / speech trackers (mirrors _noise_tracker, _recent_speech)
+let noiseTracker=[], speechBuf=[], noiseFloor=0;
+let eThr=0, rThr=0;   // energy_threshold, recovery_threshold
 
+// Calibration
+let ambBuf=[], calibBuf=[], recalCounter=0, calibrated=false;
+
+// Metronome
 let metOn=false, cnt=0;
 let metroTimer=null, nextBeat=0, beatIdx=0;
-let metroOnTime=0, metroOffTime=0, recovStart=null;
 
-let lastSpeechTime=0;
+// Mode 1 — energy drop (_low_energy_start)
 let lowEnergyStart=null;
-let wrepCrossings=[], lastWrepAbove=null, lastWrepCrossMs=0;
+
+// Mode 3 — oscillation (_energy_crossings, _was_above_threshold, _oscillation_active)
+let energyCrossings=[], wasAbove=false, oscActive=false;
+
+// Recovery (_recovery_start)
+let recovStart=null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function pct(arr,p){{
-  const s=[...arr].sort((a,b)=>a-b);
-  return s[Math.floor(s.length*p)]||0;
+// mirrors _smoothed_energy()
+function getSMA(r){{
+  smaBuf.push(r);
+  if(smaBuf.length>SMA_WIN) smaBuf.shift();
+  return smaBuf.reduce((a,b)=>a+b)/smaBuf.length;
 }}
-function mean(arr){{return arr.length?arr.reduce((a,b)=>a+b)/arr.length:0;}}
-function getSNR(v){{return noiseFloor>0?v/noiseFloor:100;}}
-function setStatus(m){{document.getElementById('st').textContent=m;}}
-function setPh(m)    {{document.getElementById('ph').textContent=m;}}
 
-function updateNoise(v){{
-  noiseTracker.push(v);
+// mirrors _update_noise_floor()
+function updateNoise(r){{
+  noiseTracker.push(r);
   if(noiseTracker.length>NOISE_WIN) noiseTracker.shift();
-  noiseFloor=pct(noiseTracker,0.30);
+  const s=[...noiseTracker].sort((a,b)=>a-b);
+  noiseFloor=s[Math.floor(s.length*0.30)]||0;
 }}
-function updateSpeech(v){{
-  speechBuf.push(v);
+
+// mirrors _update_speech_level()
+function updateSpeech(r){{
+  speechBuf.push(r);
   if(speechBuf.length>SPEECH_WIN) speechBuf.shift();
 }}
 
+// mirrors _get_snr()
+function getSNR(v){{return noiseFloor>0?v/noiseFloor:100;}}
+
+// mirrors _recalculate_thresholds()
 function recalc(){{
   if(!speechBuf.length) return;
-  const avg=mean(speechBuf), noise=Math.max(noiseFloor,0.0001);
+  const avg=speechBuf.reduce((a,b)=>a+b)/speechBuf.length;
+  const noise=Math.max(noiseFloor,0.0001);
   const dyn=avg-noise;
   if(dyn<=0){{eThr=noise*1.2; rThr=noise*1.5;}}
   else      {{eThr=noise+dyn*DROP_RATIO; rThr=noise+dyn*0.45;}}
-  // Word-rep midpoint: low enough to catch individual word humps via smoothFast
-  wrepMid=noise+dyn*0.20;
 }}
+
+function setStatus(m){{document.getElementById('st').textContent=m;}}
+function setPh(m)    {{document.getElementById('ph').textContent=m;}}
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 async function startSess(){{
@@ -203,15 +207,13 @@ async function startSess(){{
     ana=actx.createAnalyser(); ana.fftSize=2048; ana.smoothingTimeConstant=0.0;
     src.connect(ana);
 
-    running=true; smooth=0; smoothFast=0; rms=0;
-    t0=Date.now(); lastFrameMs=0;
-    ambBuf=[]; noiseTracker=[]; noiseFloor=0;
-    calibBuf=[]; speechBuf=[];
-    eThr=0; rThr=0; wrepMid=0; recalCounter=0;
+    running=true; t0=Date.now(); lastFrameMs=0;
+    smaBuf=[]; rms=0;
+    ambBuf=[]; calibBuf=[]; noiseTracker=[]; speechBuf=[]; noiseFloor=0;
+    eThr=0; rThr=0; recalCounter=0; calibrated=false;
     metOn=false; cnt=0;
-    metroOnTime=0; metroOffTime=Date.now()-MIN_OFF_MS;
-    recovStart=null; lastSpeechTime=0; lowEnergyStart=null;
-    wrepCrossings=[]; lastWrepAbove=null; lastWrepCrossMs=0;
+    lowEnergyStart=null;
+    energyCrossings=[]; wasAbove=false; oscActive=false; recovStart=null;
     phase=1;
 
     document.getElementById('bs').style.display='none';
@@ -222,168 +224,191 @@ async function startSess(){{
     document.getElementById('mm').textContent='Idle';
     document.getElementById('msnr').textContent='—';
     loop();
-  }}catch(e){{setStatus('Mic error: '+e.message+' — allow mic and retry');}}
+  }}catch(e){{setStatus('Mic error: '+e.message+' — allow mic access and retry');}}
 }}
 
-// ── Main loop ─────────────────────────────────────────────────────────────────
+// ── Main loop (100 ms per frame, mirrors block_size=1600 @ 16kHz) ─────────────
 function loop(){{
   if(!running) return;
   requestAnimationFrame(loop);
   const now=Date.now();
-  if(now-lastFrameMs<80) return;   // ~12 fps
+  if(now-lastFrameMs<90) return;   // ~100ms frames
   lastFrameMs=now;
 
+  // Compute RMS for this frame
   const buf=new Float32Array(ana.frequencyBinCount);
   ana.getFloatTimeDomainData(buf);
   let s=0; for(let i=0;i<buf.length;i++) s+=buf[i]*buf[i];
-  rms       = Math.sqrt(s/buf.length);
-  smooth    = SLOW_K*smooth     + (1-SLOW_K)*rms;
-  smoothFast= FAST_K*smoothFast + (1-FAST_K)*rms;
+  rms=Math.sqrt(s/buf.length);
 
+  // Update elapsed time display
   const el=(now-t0)/1000;
   document.getElementById('mt').textContent=Math.floor(el)+'s';
 
-  // ── Phase 1: Ambient ───────────────────────────────────────────────────────
+  // ── PHASE 0: Ambient noise (mirrors frame_idx <= AMBIENT_FRAMES) ──────────
   if(phase===1){{
     ambBuf.push(rms); updateNoise(rms);
     const rem=Math.max(0,Math.ceil(1-el));
     setStatus('Learning ambient noise… stay silent ('+rem+'s)');
-    setPh('Step 1/4 — Ambient calibration');
-    if(ambBuf.length>=AMBIENT_FRAMES) phase=2;
+    setPh('Phase 1/4 — Ambient calibration');
+    if(ambBuf.length>=AMBIENT_FRAMES){{
+      noiseFloor=noiseTracker.slice().sort((a,b)=>a-b)[Math.floor(noiseTracker.length*0.3)]||0;
+      phase=2;
+    }}
     return;
   }}
 
-  // ── Phase 2: Wait for speech ───────────────────────────────────────────────
+  // ── PHASE 1: Wait for speech (mirrors _user_has_spoken check) ────────────
   if(phase===2){{
     const snr=getSNR(rms);
     document.getElementById('msnr').textContent=snr.toFixed(1)+'×';
     if(snr>SNR_THRESH && rms>0.002){{
       phase=3;
       setStatus('Calibrating… keep speaking naturally');
-      setPh('Step 2/4 — Measuring your voice level');
+      setPh('Phase 2/4 — Measuring your voice level');
     }}else{{
       updateNoise(rms);
       setStatus('Listening… start speaking now');
-      setPh('Step 2/4 — Waiting for speech (SNR '+snr.toFixed(1)+'×)');
+      setPh('Phase 2/4 — Waiting for speech (SNR: '+snr.toFixed(1)+'×)');
     }}
     return;
   }}
 
-  // ── Phase 3: Calibrate ────────────────────────────────────────────────────
+  // ── PHASE 2: Calibrate (mirrors _calibrated check) ────────────────────────
   if(phase===3){{
     const snr=getSNR(rms);
     document.getElementById('msnr').textContent=snr.toFixed(1)+'×';
-    if(snr>SNR_THRESH){{calibBuf.push(rms); updateSpeech(rms);}}
+    if(snr>SNR_THRESH) calibBuf.push(rms);
     const rem=Math.max(0,CALIB_FRAMES-calibBuf.length);
     setStatus('Calibrating… ('+rem+' frames left, keep speaking)');
-    setPh('Step 3/4 — Computing thresholds');
+    setPh('Phase 3/4 — Computing thresholds');
     if(calibBuf.length>=CALIB_FRAMES){{
-      noiseFloor=pct(noiseTracker,0.30); recalc();
+      // Mirror lines 379-400 of live_session.py
+      const avg=calibBuf.reduce((a,b)=>a+b)/calibBuf.length;
+      speechBuf=[...calibBuf];
+      const noise=Math.max(noiseFloor,0.0001);
+      const dyn=avg-noise;
+      if(dyn<=0){{eThr=noise*1.2; rThr=noise*1.5;}}
+      else      {{eThr=noise+dyn*DROP_RATIO; rThr=noise+dyn*0.45;}}
+      calibrated=true; smaBuf=[]; wasAbove=false;
       phase=4;
       setStatus('Monitoring — metronome auto-starts on stutter');
-      setPh('Step 4/4 — Live detection active ✓');
+      setPh('Phase 4/4 — Live detection active ✓');
     }}
     return;
   }}
 
-  // ── Phase 4: MONITORING ───────────────────────────────────────────────────
-  const snrNow=getSNR(smooth);
-  document.getElementById('msnr').textContent=snrNow.toFixed(1)+'×';
+  // ── PHASE 3: Stutter detection (mirrors lines 429-476 of live_session.py) ──
 
-  // Adaptive trackers — SNR-based so soft speech updates thresholds too
-  if(smooth<eThr) updateNoise(rms);
-  if(snrNow>SNR_THRESH && smooth>eThr) updateSpeech(rms);
-  if(++recalCounter>=RECAL_EVERY){{recalCounter=0; recalc();}}
+  // _smoothed_energy(rms) — 4-frame SMA
+  const smoothed=getSMA(rms);
+  document.getElementById('msnr').textContent=getSNR(smoothed).toFixed(1)+'×';
 
-  // Speech context — any frame where SNR shows clear voice
-  if(snrNow>SNR_THRESH) lastSpeechTime=now;
-  const speechRecent     = lastSpeechTime>0 && (now-lastSpeechTime)<MAX_SPEECH_GAP;
-  const speechRecentWrep = lastSpeechTime>0 && (now-lastSpeechTime)<MAX_SPEECH_WREP;
+  // Continuously track noise floor from low-energy frames (line 432-433)
+  if(smoothed<eThr) updateNoise(rms);
 
-  // When not speaking, reset timers so no stale data carries over
-  if(!speechRecent)  lowEnergyStart=null;
-  if(!speechRecentWrep){{ wrepCrossings=[]; }}
+  // Track speech energy from high-energy frames (line 436-437)
+  if(smoothed>rThr) updateSpeech(rms);
 
-  // ── Recovery ──────────────────────────────────────────────────────────────
-  if(metOn){{
-    if(smooth>rThr){{
-      if(!recovStart) recovStart=now;
-      else if(now-recovStart>=GRACE_MS && now-metroOnTime>=MIN_ON_MS)
-        stopMetro('energy_recovery');
-    }}else recovStart=null;
-    return;
-  }}
+  // Periodically re-calculate thresholds (lines 441-444)
+  recalCounter++;
+  if(recalCounter>=RECAL_EVERY){{recalCounter=0; recalc();}}
 
-  // ── MODE 1: Block — sustained silence during speech ───────────────────────
-  // Requires: energy below threshold  AND  SNR near ambient (< SNR_THRESH)
-  // SNR gate prevents soft voice (SNR 5-15×) from triggering; only true
-  // near-silence (SNR ~1×) counts as a block.
-  if(smooth<eThr && snrNow<SNR_THRESH && speechRecent){{
+  // ── Detection Mode 1: Energy drop (lines 447-466) ────────────────────────
+  if(smoothed<eThr){{
     if(!lowEnergyStart) lowEnergyStart=now;
-    if(now-lowEnergyStart>=PAUSE_IGNORE && now-metroOffTime>=MIN_OFF_MS){{
-      trigger('block'); return;
+    const lowDur=now-lowEnergyStart;
+    if(lowDur>=PAUSE_IGNORE){{
+      triggerMetronome('energy_drop');
     }}
-  }}else lowEnergyStart=null;
-
-  // ── MODE 3: Word repetition — fast rhythmic energy humps ─────────────────
-  // Uses smoothFast (K=0.3, τ≈80 ms): fast enough to track individual word
-  // humps (200–400 ms) but not raw noise.
-  // WREP_AVG_MAX=300 ms is the critical discriminator:
-  //   Stuttered repetitions ("the-the-the"): ~100–250 ms per crossing ✓
-  //   Normal speech word boundaries:          ~300–600 ms per crossing ✗
-  if(speechRecentWrep){{
-    const aboveWrep=(smoothFast>wrepMid);
-    if(lastWrepAbove!==null && aboveWrep!==lastWrepAbove){{
-      if(now-lastWrepCrossMs>WREP_DBN_MS){{
-        wrepCrossings.push(now);
-        lastWrepCrossMs=now;
-      }}
+  }}else{{
+    // Energy above stutter threshold
+    if(smoothed>rThr){{
+      // Mirrors: self._stop_metronome(elapsed, 'energy_recovery')
+      tryStop();
     }}
-    lastWrepAbove=aboveWrep;
+    lowEnergyStart=null;   // Reset low-energy timer
   }}
-  wrepCrossings=wrepCrossings.filter(t=>now-t<WREP_WIN_MS);
 
-  if(wrepCrossings.length>=WREP_MIN && now-metroOffTime>=MIN_OFF_MS){{
-    const gaps=[];
-    for(let i=1;i<wrepCrossings.length;i++) gaps.push(wrepCrossings[i]-wrepCrossings[i-1]);
-    const a=mean(gaps), gMax=Math.max(...gaps), gMin=Math.min(...gaps);
-    const rhythmic=(gMax-gMin)<a*WREP_RHYTHM;
-    if(a>=WREP_AVG_MIN && a<=WREP_AVG_MAX && rhythmic){{
-      trigger('repetition'); return;
+  // ── Detection Mode 3: Energy oscillation (lines 472-476) ─────────────────
+  // Mirrors _check_energy_oscillation(smoothed, elapsed)
+  checkOscillation(smoothed, now);
+}}
+
+// mirrors _check_energy_oscillation()
+function checkOscillation(smoothed, now){{
+  if(!calibrated) return;
+
+  // "Use midpoint between noise floor and speech average as crossing line"
+  const midpoint=(eThr+rThr)/2;
+  const isAbove=(smoothed>midpoint);
+
+  // "Detect threshold crossing (above→below or below→above)"
+  if(isAbove!==wasAbove){{
+    energyCrossings.push(now);
+    wasAbove=isAbove;
+  }}
+
+  // "Trim old crossings outside the window"
+  energyCrossings=energyCrossings.filter(t=>now-t<OSC_WIN_MS);
+
+  const count=energyCrossings.length;
+
+  if(count>=OSC_MIN){{
+    // "4+ crossings in 1.5 s = syllable stuttering → trigger"
+    if(!oscActive){{
+      oscActive=true;
+      triggerMetronome('syllable_stutter');
+    }}
+  }}else{{
+    // "Oscillation stopped — check for recovery"
+    if(oscActive && count<=1){{
+      oscActive=false;
+      // Mirrors: if not self._rep_stutter_active: self._stop_metronome(...)
+      tryStop();
     }}
   }}
 }}
 
-// ── Trigger / Stop ────────────────────────────────────────────────────────────
-function trigger(type){{
-  if(!AUTO_MET||metOn) return;
+// ── triggerMetronome — mirrors _trigger_metronome() ──────────────────────────
+function triggerMetronome(reason){{
+  if(!AUTO_MET) return;
+  // "Reset any pending recovery — stutter is happening again"
+  recovStart=null;
+  if(metOn) return;  // "Already playing"
   metOn=true; cnt++;
-  metroOnTime=Date.now(); recovStart=null;
-  lowEnergyStart=null; wrepCrossings=[];   // clear all pending data
-  startMetro();
+  setStatus((reason==='energy_drop'?'Block':'Syllable stutter')+' — follow the metronome!');
+  document.getElementById('metroType').textContent=
+    (reason==='energy_drop'?'Block detected':'Syllable stutter — follow the rhythm');
+  document.getElementById('mc').classList.add('on');
   document.getElementById('ms').textContent=cnt;
   document.getElementById('mm').textContent='ACTIVE';
-  const lab={{block:'Block detected',repetition:'Repetition ×3 detected'}};
-  setStatus((lab[type]||'Stutter detected')+' — follow the metronome!');
-  document.getElementById('metroType').textContent=(lab[type]||'Stutter')+' — follow the rhythm';
-  document.getElementById('mc').classList.add('on');
   setPh('🔴 Stutter event #'+cnt);
+  startMetro();
 }}
 
-function stopMetro(reason){{
-  if(!metOn) return;
-  metOn=false; metroOffTime=Date.now(); recovStart=null;
-  lowEnergyStart=null;
-  wrepCrossings=[]; lastWrepAbove=null; // clear so no immediate re-trigger
+// ── tryStop — mirrors _stop_metronome() with grace period ────────────────────
+// "Instead of stopping instantly, requires fluent speech to persist
+//  for _RECOVERY_GRACE_SEC seconds."
+function tryStop(){{
+  if(!metOn){{ recovStart=null; return; }}
+  const now=Date.now();
+  if(!recovStart){{ recovStart=now; return; }}  // Start grace timer
+  if(now-recovStart<GRACE_MS) return;            // Still in grace period
+  // Grace period elapsed — stop metronome
+  metOn=false; recovStart=null; oscActive=false;
+  // Clear crossing buffer (browser adaptation: prevents speaker→mic feedback
+  // loop from old click sounds creating immediate re-trigger)
+  energyCrossings=[]; wasAbove=false;
   clearTimeout(metroTimer);
   document.querySelectorAll('.dot').forEach(d=>d.classList.remove('on'));
   document.getElementById('mc').classList.remove('on');
   document.getElementById('mm').textContent='Idle';
   setStatus('Monitoring — metronome auto-starts on stutter');
-  setPh('Step 4/4 — Live detection active ✓');
+  setPh('Phase 4/4 — Live detection active ✓');
 }}
 
-// ── Metronome (Web Audio) ─────────────────────────────────────────────────────
+// ── Metronome (Web Audio precise scheduling) ──────────────────────────────────
 function startMetro(){{beatIdx=0; nextBeat=actx.currentTime+0.05; sched();}}
 function sched(){{
   if(!metOn) return;
