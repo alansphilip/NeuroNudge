@@ -148,6 +148,13 @@ for key, val in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
+# ── Auto-login from URL param (survives page refresh) ─────────────────────────
+if not st.session_state.logged_in:
+    _qp_user = st.query_params.get('user', '')
+    if _qp_user:
+        st.session_state.logged_in = True
+        st.session_state.username = _qp_user
+
 
 # ─────────────────────────────────────────────
 # Animated SVG Logo — Microphone with Sound Arcs
@@ -295,6 +302,7 @@ def page_login():
             if username.strip():
                 st.session_state.logged_in = True
                 st.session_state.username = username.strip()
+                st.query_params['user'] = username.strip()  # persist in URL
                 st.rerun()
             else:
                 st.error("Please enter your name to continue.")
@@ -366,6 +374,7 @@ with st.sidebar:
         unsafe_allow_html=True
     )
     if st.button("Sign Out", key="logout", use_container_width=True):
+        st.query_params.clear()  # remove URL-persisted login
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()

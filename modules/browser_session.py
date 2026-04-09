@@ -128,7 +128,7 @@ const PROLONG_MS=700, PROLONG_VAR=0.00015;
 
 // Repetition state
 let crossings=[],lastCross=null;
-const REP_WIN_MS=2000,REP_MIN=3,REP_MAX_GAP=500,REP_MIN_GAP=80;
+const REP_WIN_MS=2500,REP_MIN=3,REP_MAX_GAP=600,REP_MIN_GAP=120;
 
 async function startSess() {{
   try {{
@@ -240,7 +240,10 @@ function loop() {{
       const gaps=[];
       for(let i=1;i<crossings.length;i++) gaps.push(crossings[i]-crossings[i-1]);
       const avg=gaps.reduce((a,b)=>a+b)/gaps.length;
-      if(avg<REP_MAX_GAP && avg>REP_MIN_GAP && now-metroOffTime>=MIN_OFF_MS) {{
+      const maxGap=Math.max(...gaps), minGap=Math.min(...gaps);
+      // Rhythmicity gate: gaps must be evenly spaced — hallmark of true word repetition
+      const rhythmic=(maxGap-minGap)<avg*0.7;
+      if(avg<REP_MAX_GAP && avg>REP_MIN_GAP && rhythmic && now-metroOffTime>=MIN_OFF_MS) {{
         trigger('repetition'); crossings=[]; return;
       }}
     }}
