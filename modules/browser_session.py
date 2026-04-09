@@ -310,14 +310,15 @@ function loop(){{
   // ── Phase 4: MONITORING ──────────────────────────────────────────────────
   document.getElementById('msnr').textContent=getSNR(smooth).toFixed(1)+'×';
 
-  // Adaptive trackers
+  // Adaptive trackers — use SNR-based update so soft speech adapts thresholds
   if(smooth<eThr) updateNoise(rms);
-  if(smooth>rThr) updateSpeech(rms);
+  // Update speech level whenever SNR shows clear speech (adapts to soft voice)
+  if(getSNR(smooth) > SNR_THRESH && smooth > eThr) updateSpeech(rms);
   if(++recalCounter>=RECAL_EVERY){{recalCounter=0; recalc();}}
 
-  // Track last active speech moment (energy clearly above noise)
-  // This is the key guard against natural pauses triggering the metronome.
-  if(smooth > rThr*0.7) lastSpeechTime=now;
+  // Track last active speech moment using SNR (catches soft speech too).
+  // SNR > SNR_THRESH means the voice is clearly above ambient — even when quiet.
+  if(getSNR(smooth) > SNR_THRESH) lastSpeechTime=now;
 
   const speechWasRecent     = lastSpeechTime>0 && (now-lastSpeechTime)<MAX_SPEECH_GAP;
   const speechWasRecentWrep = lastSpeechTime>0 && (now-lastSpeechTime)<MAX_SPEECH_GAP_WREP;
@@ -343,14 +344,17 @@ function loop(){{
   }}
 
   // ── Mode 1: Energy-drop block ─────────────────────────────────────────────
-  // ONLY fires when speech was active within MAX_SPEECH_GAP ms.
-  // Natural pauses, full stops, and end-of-sentence silence are excluded.
-  if(smooth<eThr && speechWasRecent){{
+  // Conditions: speech was recent + energy is low + SNR dropped near ambient.
+  // The SNR check is the key fix:
+  //   Soft voice → energy may dip below eThr BUT SNR stays high (5-15x) → no trigger
+  //   True block → energy drops + SNR falls toward 1x (near silence)    → trigger
+  const snrNow = getSNR(smooth);
+  if(smooth < eThr && snrNow < SNR_THRESH && speechWasRecent) {{
     if(!lowEnergyStart) lowEnergyStart=now;
-    if(now-lowEnergyStart>=PAUSE_IGNORE && now-metroOffTime>=MIN_OFF_MS){{
+    if(now-lowEnergyStart >= PAUSE_IGNORE && now-metroOffTime >= MIN_OFF_MS) {{
       trigger('block'); return;
     }}
-  }}else lowEnergyStart=null;
+  }} else lowEnergyStart=null;
 
   // ── Mode 2: Syllable stutter — smoothMid crossings at oscMid ───────────────
   // Uses medium EMA (K=0.6, τ≈140ms) — mirrors Python's 4-frame rolling average.
